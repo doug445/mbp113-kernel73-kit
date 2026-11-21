@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# nouveau-smi — nvidia-smi-style readout for nouveau GPUs.
+# Auto-discovers hwmon + debugfs paths by name (no hardcoded indices).
+# Reading clocks (pstate) needs root; run with sudo for the full picture.
+set -u
+
+# --- locate the nouveau hwmon node by name ---
+HWMON=""
+for h in /sys/class/hwmon/hwmon*; do
+    [ "$(cat "$h/name" 2>/dev/null)" = "nouveau" ] && HWMON="$h" && break
+done
+
+# --- locate the nouveau debugfs dir (has a pstate file) ---
+PSTATE=""
+for d in /sys/kernel/debug/dri/*/; do
+    n=$(cat "$d/name" 2>/dev/null)
+    case "$n" in
+        nouveau*) [ -e "${d}pstate" ] && PSTATE="${d}pstate" && break ;;
+    esac
+done
+
+rd() { cat "$1" 2>/dev/null; }
+
+# --- GPU name via lspci (first NVIDIA VGA device) ---
+GPU=$(lspci 2>/dev/null | grep -m1 -iE 'VGA.*NVIDIA' | sed -E 's/.*\[(.*)\].*/\1/')
+[ -z "$GPU" ] && GPU="NVIDIA (nouveau)"
+
+# --- temperatures / voltage from hwmon ---
+if [ -n "$HWMON" ]; then
+    t=$(rd "$HWMON/temp1_input");  temp=$(( ${t:-0} / 1000 ))
+    c=$(rd "$HWMON/temp1_crit");   crit=$(( ${c:-0} / 1000 ))
+    m=$(rd "$HWMON/temp1_max");    tmax=$(( ${m:-0} / 1000 ))
+    mv=$(rd "$HWMON/in0_input")
+else
+    temp="?"; crit="?"; tmax="?"; mv=""
+fi
+
+# --- current pstate / clocks ---
+cur="n/a"; core="n/a"; mem="n/a"; pline=""
+if [ -n "$PSTATE" ]; then
+    pline=$(grep '\*' "$PSTATE" 2>/dev/null)
+    if [ -n "$pline" ]; then
+        cur=$(echo "$pline"  | awk -F: '{print $1}')
+        core=$(echo "$pline" | grep -oE 'core [0-9-]+ ?[0-9]* ?MHz' | head -1 | sed 's/core //')
+        mem=$(echo "$pline"  | grep -oE 'memory [0-9]+ MHz' | sed 's/memory //')
+    elif [ ! -r "$PSTATE" ]; then
+        cur="(run as root)"
+    fi
+fi
+
+# --- fan RPMs (applesmc, if present — these cool the GPU on Macs) ---
+FANDIR=/sys/devices/platform/applesmc.768
+# Linux 7.3+: the fan files moved into applesmc's hwmon child directory.
+if [ ! -e "$FANDIR/fan1_input" ]; then
+    for d in "$FANDIR"/hwmon/hwmon*; do
+        [ -e "$d/fan1_input" ] && { FANDIR=$d; break; }
+    done
+fi
+fans=""
+if [ -d "$FANDIR" ]; then
+    f1=$(rd "$FANDIR/fan1_input"); f2=$(rd "$FANDIR/fan2_input")
+    fans="${f1:-?}/${f2:-?}"
+fi
+
+# --- temperature color (only on a color-capable TTY) ---
+col=""; rst=""
+if [ -t 1 ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    col=$'\e[32m'; rst=$'\e[0m'   # green
+    if [ "$temp" != "?" ]; then
+        [ "$temp" -ge 80 ] && col=$'\e[33m'   # amber
+        [ "$temp" -ge 90 ] && col=$'\e[31m'   # red
+    fi
+fi
+
+printf '%s\n' "+-----------------------------------------------------------------+"
+printf '| %-63s |\n' "nouveau-smi    $(date '+%a %b %d %H:%M:%S %Y')"
+printf '%s\n' "+-----------------------------------------------------------------+"
+printf '| GPU   %-57s |\n' "$GPU"
+printf '%s\n' "+------------------------+----------------------------------------+"
+printf '| %s%-22s%s | %-38s |\n' "$col" "$(printf 'Temp        %3s C' "$temp")" "$rst" "$(printf 'Throttle: max %s C  crit %s C' "$tmax" "$crit")"
+printf '| %-22s | %-38s |\n' "$(printf 'Voltage    %5s mV' "${mv:-?}")" "$(printf 'Pstate:   %s' "$cur")"
+printf '| %-22s | %-38s |\n' "$(printf 'Core clock %s' "${core:-n/a}")" "$(printf 'Mem clock %s' "${mem:-n/a}")"
+if [ -n "$fans" ]; then
+printf '| %-22s | %-38s |\n' "$(printf 'Fan rpm  %s' "$fans")" "chassis fans cool CPU + GPU (SMC)"
+fi
+printf '%s\n' "+------------------------+----------------------------------------+"
+
+if [ "$cur" = "n/a" ] || [ "$cur" = "(run as root)" ]; then
+    echo "note: clocks/pstate need root — run: sudo nouveau-smi"
+fi

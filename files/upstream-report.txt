@@ -1,0 +1,89 @@
+To: Takashi Iwai <tiwai@suse.com>
+Cc: Jonne Vuorela <jonne.vuorela@proton.me>, Jaroslav Kysela <perex@perex.cz>,
+    linux-sound@vger.kernel.org, regressions@lists.linux.dev
+Subject: [REGRESSION] ALSA: hda/cs420x: MacBookPro11,3 internal speaker
+ half-disabled by 8086:7270 quirk (82cfab6a5262)
+
+Hi,
+
+Since v7.3, the internal speakers on a MacBookPro11,3 (CS4208) sound quiet
+and thin, with no bass. Headphones are fine. Bisected by inspection to:
+
+  82cfab6a5262 ("ALSA: hda/cs420x: Add CS4208 fixup for MacBookAir 7,2")
+
+#regzbot introduced: 82cfab6a5262
+
+That commit maps PCI SSID 8086:7270 to CS4208_MAC_AUTO and, in
+cs4208_mac_fixup_tbl, to CS4208_MBA6. 8086:7270 is a generic Intel
+subsystem ID, not unique to the MacBookAir 7,2. This MacBookPro11,3 reports
+the same PCI SSID on its HDA controller, so it now gets mba6_pincfgs:
+
+  DMI:     MacBookPro11,3 (board Mac-2BD1B31983FE1663, firmware 478.0.0.0.0)
+  00:1b.0  Intel 8 Series HDA [8086:8c20], Subsystem [8086:7270]
+  Codec:   CS4208, vendor 0x10134208, subsystem 0x106b5e00, rev 0x100300
+
+v7.2.15 (correct):
+  CS4208: picked fixup  for codec SSID 106b:0000
+  CS4208: picked fixup  for codec SSID 106b:5e00
+  autoconfig for CS4208: line_outs=2 (0x12/0x13/0x0/0x0/0x0) type:speaker
+  (plus Mic=0x18, Internal Mic=0x1c, dig-out=0x21)
+
+v7.3.3 (Fedora 7.3.3-200.fc44):
+  CS4208: picked fixup  for PCI SSID 8086:7270
+  CS4208: picked fixup  for PCI SSID 8086:7270
+  autoconfig for CS4208: line_outs=1 (0x12/0x0/0x0/0x0/0x0) type:speaker
+  (only Internal Mic=0x1c; no 0x18, no dig-out)
+
+On this machine the speaker uses two pins (0x12 + 0x13, assoc 1, seq 0/2).
+The MBA6 table sets 0x13 to 0x500000f0, so half of the speaker path
+(including the bass) is never driven. It also disables the external mic
+jack and SPDIF:
+
+  pin   init (BIOS)   driver (MBA6)
+  0x13  0x90100112    0x500000f0
+  0x18  0x00ab9040    0x43ab9030
+  0x21  0x004be030    0x430000f0
+  (0x10, 0x12 and 0x1c also differ; full tables below)
+
+Forcing model=106b:5e00 or model=mbp11 via hwC0D0/modelname + reconfig did
+not help: the Mac sub-table lookup still ends at PCI SSID 8086:7270.
+
+Workaround confirmed: restoring the BIOS pins as user pin configs (HDA patch
+file [pincfg] = init_pin_configs) brings back line_outs=2 and the speaker
+sounds normal again.
+
+Matching the MacBookAir 7,2 by something unique to it would avoid catching
+other Macs that share 8086:7270. That could be its codec SSID (if it isn't
+0x106b5e00), its DMI product name, or a check that only falls back to the PCI
+SSID when the codec SSID is not an Apple one. This MBP's codec SSID
+(106b:5e00) is Apple's, and before this commit it was matched by that.
+Jonne, could you share the codec subsystem ID of the MacBookAir 7,2
+(cat /sys/class/sound/hwC0D0/subsystem_id)?
+
+I can test patches on the MacBookPro11,3.
+
+Full pin configs on v7.3.3:
+
+init_pin_configs     driver_pin_configs
+0x10 0x002b4020      0x10 0x032120f0
+0x11 0x400000f0      0x11 0x500000f0
+0x12 0x90100110      0x12 0x90100010
+0x13 0x90100112      0x13 0x500000f0
+0x14 0x400000f0      0x14 0x500000f0
+0x15 0x400000f0      0x15 0x770000f0
+0x16 0x400000f0      0x16 0x770000f0
+0x17 0x400000f0      0x17 0x430000f0
+0x18 0x00ab9040      0x18 0x43ab9030
+0x19 0x400000f0      0x19 0x770000f0
+0x1a 0x400000f0      0x1a 0x770000f0
+0x1b 0x400000f0      0x1b 0x770000f0
+0x1c 0x90a60100      0x1c 0x90a00090
+0x1d 0x400000f0      0x1d 0x500000f0
+0x1e 0x400000f0      0x1e 0x500000f0
+0x1f 0x400000f0      0x1f 0x500000f0
+0x20 0x400000f0      0x20 0x500000f0
+0x21 0x004be030      0x21 0x430000f0
+0x22 0x400000f0      0x22 0x430000f0
+
+Thanks,
+<your name>

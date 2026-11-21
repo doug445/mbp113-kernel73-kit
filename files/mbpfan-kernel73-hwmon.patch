@@ -1,0 +1,82 @@
+diff --git a/src/mbpfan.c b/src/mbpfan.c
+index 645b009..e0cb297 100644
+--- a/src/mbpfan.c
++++ b/src/mbpfan.c
+@@ -82,6 +82,11 @@ t_sensors *sensors = NULL;
+ t_fans *fans = NULL;
+ char applesmc_path[PATH_MAX];
+ char applesmc_fan_path[PATH_MAX];
++/* Linux 7.3+ (applesmc converted to hwmon_device_register_with_info): fan
++ * attributes live in <applesmc>/hwmon/hwmonN/, fanN_output became fanN_target
++ * and fanN_manual (0/1) became pwmN_enable (2 = auto, 1 = manual). */
++int applesmc_hwmon = 0;
++char applesmc_hwmon_dir[PATH_MAX];
+ 
+ 
+ char *smprintf(const char *fmt, ...)
+@@ -287,7 +292,7 @@ t_fans *retrieve_fans()
+     char *path_fan_min = NULL;
+ 
+     const char *path_begin = (const char *) &applesmc_fan_path;
+-    const char *path_output_end = "_output";
++    const char *path_output_end = applesmc_hwmon ? "_target" : "_output";
+     const char *path_label_end = "_label";
+     const char *path_man_end = "_manual";
+     const char *path_max_speed = "_max";
+@@ -300,7 +305,10 @@ t_fans *retrieve_fans()
+ 
+         path_output = smprintf("%s%d%s", path_begin, counter, path_output_end);
+         path_label = smprintf("%s%d%s", path_begin, counter, path_label_end);
+-        path_manual = smprintf("%s%d%s", path_begin, counter, path_man_end);
++        if (applesmc_hwmon)
++            path_manual = smprintf("%s/pwm%d_enable", (const char *) &applesmc_hwmon_dir, counter);
++        else
++            path_manual = smprintf("%s%d%s", path_begin, counter, path_man_end);
+         path_fan_min = smprintf("%s%d%s", path_begin, counter, path_min_speed);
+         path_fan_max = smprintf("%s%d%s", path_begin, counter, path_max_speed);
+ 
+@@ -382,7 +390,8 @@ static void set_fans_mode(t_fans *fans, int mode)
+         file = fopen(tmp->fan_manual_path, "rw+");
+ 
+         if (file != NULL) {
+-            fprintf(file, "%d", mode);
++            /* hwmon pwm_enable: 1 = manual, 2 = automatic */
++            fprintf(file, "%d", applesmc_hwmon ? (mode ? 1 : 2) : mode);
+             fclose(file);
+         }
+ 
+@@ -598,6 +607,34 @@ void check_requirements(const char *program_path)
+         strcat((char *) &applesmc_fan_path, "/fan");
+         if (verbose) mbp_log(LOG_INFO, "applesmc device path: %s", (char *) &applesmc_path);
+ 
++        /* Linux 7.3+: no fan files on the platform device; use its hwmon dir. */
++        char *legacy = smprintf("%s/fan1_input", (const char *) &applesmc_path);
++        int have_legacy = (access(legacy, R_OK) == 0);
++        free(legacy);
++        if (!have_legacy) {
++            char *hwmon_parent = smprintf("%s/hwmon", (const char *) &applesmc_path);
++            DIR *hdir = opendir(hwmon_parent);
++            if (hdir != NULL) {
++                struct dirent *ent;
++                while ((ent = readdir(hdir)) != NULL) {
++                    if (strncmp("hwmon", ent->d_name, 5) != 0)
++                        continue;
++                    char *probe = smprintf("%s/%s/fan1_input", hwmon_parent, ent->d_name);
++                    int ok = (access(probe, R_OK) == 0);
++                    free(probe);
++                    if (ok) {
++                        snprintf((char *) &applesmc_hwmon_dir, PATH_MAX, "%s/%s", hwmon_parent, ent->d_name);
++                        snprintf((char *) &applesmc_fan_path, PATH_MAX, "%s/fan", (char *) &applesmc_hwmon_dir);
++                        applesmc_hwmon = 1;
++                        mbp_log(LOG_INFO, "applesmc hwmon interface: %s", (char *) &applesmc_hwmon_dir);
++                        break;
++                    }
++                }
++                closedir(hdir);
++            }
++            free(hwmon_parent);
++        }
++
+     } else {
+         mbp_log(LOG_ERR, "%s needs applesmc support. Please either load it or build it into the kernel. Exiting.", program_path);
+         exit(EXIT_FAILURE);

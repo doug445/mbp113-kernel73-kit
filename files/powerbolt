@@ -1,0 +1,328 @@
+#!/usr/bin/python3
+"""
+powerbolt — thermal monitor and cooling-profile helper for the MacBook Pro 11,3.
+
+This machine cannot be overclocked: the turbo-ratio MSR (0x1AD) silently
+rejects writes, the RAPL package limits already sit far above the 47 W rating
+(100 W / 125 W), and the GT 750M reports every perf level as
+`nvclockeditable=0` while staying pinned at perf level 0. So there is no
+upward headroom to expose. What this tool does instead is go the other way:
+cap the package to run cooler and quieter, and force the fans to full when you
+want to pre-cool before a heavy job.
+
+Reads need no privileges. Only `apply` and `fans` write, and those come in via
+pkexec (see org.kde.powerbolt.policy).
+"""
+
+import glob
+import json
+import os
+import subprocess
+import sys
+
+SMC = "/sys/devices/platform/applesmc.768"
+
+
+def _fan_dir():
+    """Where the fanN_* files live. Up to Linux 7.2 that's the platform device
+    itself. From 7.3 (applesmc converted to hwmon_device_register_with_info)
+    they're only in its hwmon child, fanN_output became fanN_target and
+    fanN_manual (0/1) became pwmN_enable (2 = auto, 1 = manual)."""
+    if os.path.exists(f"{SMC}/fan1_input"):
+        return SMC
+    for d in sorted(glob.glob(f"{SMC}/hwmon/hwmon*")):
+        if os.path.exists(f"{d}/fan1_input"):
+            return d
+    return SMC
+
+
+FAN = _fan_dir()
+HWMON_FANS = FAN != SMC
+
+
+def fan_manual(i, on):
+    if HWMON_FANS:
+        return write(f"{FAN}/pwm{i}_enable", 1 if on else 2)
+    return write(f"{FAN}/fan{i}_manual", 1 if on else 0)
+
+
+def fan_output(i, rpm):
+    return write(f"{FAN}/fan{i}_{'target' if HWMON_FANS else 'output'}", rpm)
+
+
+PSTATE = "/sys/devices/system/cpu/intel_pstate"
+RAPL = "/sys/class/powercap/intel-rapl:0"
+STATE_DIR = "/run/powerbolt"
+DEFAULTS = "/etc/powerbolt/defaults.json"
+
+# Profiles only ever reduce power/heat. There is deliberately no "boost"
+# profile: with both fans at maximum this package still pins to TjMax (100 °C)
+# under all-core load, so raising limits buys nothing and only adds heat.
+PROFILES = {
+    "normal": {
+        "label": "Normal",
+        "max_khz": None,       # None -> restore hardware maximum
+        "no_turbo": 0,
+        "epb": 6,
+        "pl1_w": None,         # None -> restore recorded stock limit
+        "pl2_w": None,
+    },
+    "cool": {
+        "label": "Cool",
+        "max_khz": 2500000,    # base clock; turbo off
+        "no_turbo": 1,
+        "epb": 12,
+        "pl1_w": 35,
+        "pl2_w": 45,
+    },
+    "quiet": {
+        "label": "Quiet",
+        "max_khz": 1600000,
+        "no_turbo": 1,
+        "epb": 15,
+        "pl1_w": 20,
+        "pl2_w": 25,
+    },
+}
+
+
+# ---------------------------------------------------------------- primitives
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path, default=None):
+    v = read(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def write(path, value):
+    """Best-effort sysfs write. Returns True on success."""
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError:
+        return False
+
+
+def write_all(pattern, value):
+    ok = False
+    for p in glob.glob(pattern):
+        ok = write(p, value) or ok
+    return ok
+
+
+def unit_active(name):
+    return subprocess.run(
+        ["/usr/bin/systemctl", "is-active", "--quiet", name]
+    ).returncode == 0
+
+
+def unit(action, *names):
+    subprocess.run(["/usr/bin/systemctl", action, *names],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ------------------------------------------------------------------ defaults
+
+def stock_defaults():
+    """Stock values recorded at install time, with observed fallbacks."""
+    try:
+        with open(DEFAULTS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"pl1_uw": 100000000, "pl2_uw": 125000000,
+                "fan1_min": 2160, "fan2_min": 2000}
+
+
+# -------------------------------------------------------------------- status
+
+def coretemp_pkg():
+    """Package temperature in °C, resolving coretemp by name (hwmon numbering
+    is not stable across boots)."""
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if read(f"{hw}/name") != "coretemp":
+            continue
+        for lbl in sorted(glob.glob(f"{hw}/temp*_label")):
+            if (read(lbl) or "").startswith("Package"):
+                v = read_int(lbl.replace("_label", "_input"))
+                if v is not None:
+                    return v / 1000.0
+    return None
+
+
+def avg_mhz():
+    vals = [read_int(p) for p in
+            glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")]
+    vals = [v for v in vals if v]
+    return round(sum(vals) / len(vals) / 1000) if vals else None
+
+
+def throttle_ms():
+    """Cumulative package throttle time. The counter is per-package but exposed
+    per-cpu, so any one cpu carries the same value."""
+    return read_int(
+        "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms",
+        0)
+
+
+def throttling_now():
+    """True if the package throttled since the previous status poll.
+
+    Cached in the caller's runtime dir so the monitor needs no privileges.
+    """
+    cache = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "powerbolt-throttle")
+    now = throttle_ms()
+    prev = read_int(cache)
+    try:
+        with open(cache, "w") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+    return prev is not None and now > prev
+
+
+def current_profile():
+    """Recorded profile, else infer from the live frequency cap."""
+    saved = read(f"{STATE_DIR}/profile")
+    if saved in PROFILES:
+        return saved
+    cap = read_int("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq")
+    hw = read_int("/sys/devices/system/cpu/cpufreq/policy0/cpuinfo_max_freq")
+    if cap is None:
+        return "unknown"
+    if hw and cap >= hw:
+        return "normal"
+    for name, p in PROFILES.items():
+        if p["max_khz"] and abs(cap - p["max_khz"]) < 50000:
+            return name
+    return "custom"
+
+
+def status():
+    d = stock_defaults()
+    f1min = read_int(f"{FAN}/fan1_min", 0)
+    f1max = read_int(f"{FAN}/fan1_max", 0)
+    pl1 = read_int(f"{RAPL}/constraint_0_power_limit_uw")
+    pl2 = read_int(f"{RAPL}/constraint_1_power_limit_uw")
+    temp = coretemp_pkg()
+
+    return {
+        "temp": temp,
+        "mhz": avg_mhz(),
+        "max_mhz": round((read_int(
+            "/sys/devices/system/cpu/cpufreq/policy0/cpuinfo_max_freq") or 0) / 1000),
+        "cap_mhz": round((read_int(
+            "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq") or 0) / 1000),
+        "throttling": throttling_now(),
+        "throttle_ms": throttle_ms(),
+        "fan1": read_int(f"{FAN}/fan1_input"),
+        "fan2": read_int(f"{FAN}/fan2_input"),
+        "fan1_max": f1max,
+        "fan2_max": read_int(f"{FAN}/fan2_max", 0),
+        # Fans are "forced" when their floor has been raised to the ceiling.
+        "fans_max": bool(f1max and f1min >= f1max - 50),
+        "profile": current_profile(),
+        "governor": read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        "no_turbo": read_int(f"{PSTATE}/no_turbo"),
+        "epb": read_int("/sys/devices/system/cpu/cpu0/power/energy_perf_bias"),
+        "pl1_w": round(pl1 / 1e6, 1) if pl1 else None,
+        "pl2_w": round(pl2 / 1e6, 1) if pl2 else None,
+        "mbpfan": unit_active("mbpfan.service"),
+        "thermald": unit_active("thermald.service"),
+    }
+
+
+# -------------------------------------------------------------------- actions
+
+def require_root():
+    if os.geteuid() != 0:
+        sys.exit("powerbolt: this action needs root (run via pkexec)")
+
+
+def apply_profile(name):
+    require_root()
+    if name not in PROFILES:
+        sys.exit(f"powerbolt: unknown profile '{name}'")
+    p = PROFILES[name]
+    d = stock_defaults()
+
+    # no_turbo must be cleared *before* scaling_max_freq is written: while it
+    # is set, cpufreq clamps the policy ceiling to the non-turbo max (2.5 GHz),
+    # so a 3.7 GHz write would silently land at 2.5 and stay there.
+    write(f"{PSTATE}/no_turbo", p["no_turbo"])
+    hw_max = read_int("/sys/devices/system/cpu/cpufreq/policy0/cpuinfo_max_freq")
+    cap = p["max_khz"] or hw_max
+    if cap:
+        write_all("/sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq", cap)
+    # max_perf_pct is a second, coarser clamp; harmless if passive mode ignores it.
+    write(f"{PSTATE}/max_perf_pct",
+          100 if p["max_khz"] is None else max(1, round(100 * cap / hw_max)))
+    write_all("/sys/devices/system/cpu/cpu*/power/energy_perf_bias", p["epb"])
+
+    pl1 = int(p["pl1_w"] * 1e6) if p["pl1_w"] else d["pl1_uw"]
+    pl2 = int(p["pl2_w"] * 1e6) if p["pl2_w"] else d["pl2_uw"]
+    write(f"{RAPL}/constraint_0_power_limit_uw", pl1)
+    write(f"{RAPL}/constraint_1_power_limit_uw", pl2)
+
+    # Cooling profiles never take thermal supervision away.
+    if not unit_active("thermald.service"):
+        unit("start", "thermald.service")
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write(f"{STATE_DIR}/profile", name)
+    print(f"profile: {p['label']}")
+
+
+def set_fans(mode):
+    require_root()
+    d = stock_defaults()
+    if mode == "max":
+        # mbpfan would immediately fight us for the same registers.
+        unit("stop", "mbpfan.service")
+        for i, key in ((1, "fan1_max"), (2, "fan2_max")):
+            top = read_int(f"{FAN}/fan{i}_max")
+            if not top:
+                continue
+            fan_manual(i, True)
+            fan_output(i, top)
+            write(f"{FAN}/fan{i}_min", top)
+        print("fans: maximum")
+    elif mode == "auto":
+        write(f"{FAN}/fan1_min", d["fan1_min"])
+        write(f"{FAN}/fan2_min", d["fan2_min"])
+        # Hand the fans back to the SMC first, so they never stay pinned at
+        # maximum if mbpfan fails to start; mbpfan re-takes manual control.
+        fan_manual(1, False)
+        fan_manual(2, False)
+        unit("start", "mbpfan.service")
+        print("fans: automatic")
+    else:
+        sys.exit(f"powerbolt: unknown fan mode '{mode}'")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] == "status":
+        print(json.dumps(status()))
+    elif args[0] == "apply" and len(args) == 2:
+        apply_profile(args[1])
+    elif args[0] == "fans" and len(args) == 2:
+        set_fans(args[1])
+    else:
+        sys.exit("usage: powerbolt [status | apply <normal|cool|quiet> | "
+                 "fans <auto|max>]")
+
+
+if __name__ == "__main__":
+    main()
