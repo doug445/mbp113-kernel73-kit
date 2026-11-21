@@ -70,6 +70,13 @@ developed and tested on nouveau only.
 - MacBookPro11,3 (Late 2013, i7-4850HQ, GT 750M on nouveau), Fedora 44 with
   kernel 7.3.3, and Fedora 45 with kernel 7.3.4.
 
+## Related projects
+
+Also made for the MacBook Pro 11,3 on Linux (nouveau, Plasma 6):
+
+- [mbp-resume-fix](https://github.com/doug445/mbp-resume-fix): fixes what closing and reopening the lid breaks, a CPU stuck at 800 MHz (BD_PROCHOT) and fans stuck at minimum, and installs upstream mbpfan 2.5.0.
+- [matrixrain-plasma6](https://github.com/doug445/matrixrain-plasma6): a Matrix rain wallpaper for Plasma 6, with the glow removed and animation that stops while a maximized window covers it.
+
 ## License
 
 The kit's own scripts and tools (`install.sh`, `diagnose.sh`,
